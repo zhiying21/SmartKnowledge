@@ -1,10 +1,19 @@
 # 智知库（SmartKnowledge）数据库设计文档
 
-> **文档版本**：v1.0  
+> **文档版本**：v1.1  
 > **基于FSD版本**：v1.0  
 > **生成日期**：2026-07-05  
 > **目标数据库**：PostgreSQL 15+ / Milvus 2.3+ / Redis 7+  
-> **文档状态**：技术评审中
+> **文档状态**：评审修订完成
+
+---
+
+## 修订记录
+
+| 版本 | 日期 | 修订人 | 修订内容 |
+|------|------|--------|----------|
+| v1.0 | 2026-07-05 | 技术团队 | 初稿：完成核心数据字典、向量与Redis设计 |
+| v1.1 | 2026-07-05 | 技术团队 | 根据开发手册评审修订：补充 prompt_templates/standard_answers/model_provider_configs 表；明确 Milvus 单 Collection + `kb_{kb_id}` Partition 隔离；拆分 documents 处理/生命周期状态；优化 document_chunks 字段说明与索引；调整 audit_logs 主键与 trace_id 索引；明确 task_queue 为 Celery 运营视图；更新 Redis Query 缓存用户维度与 Celery key 隔离 |
 
 ---
 
@@ -87,9 +96,9 @@
 │  └── 分区表：audit_logs, token_usage_logs（按时间RANGE分区）   │
 ├─────────────────────────────────────────────────────────────┤
 │  Milvus 2.3+ (向量数据库)                                    │
-│  ├── Collection: document_chunks（按kb_id物理隔离）          │
+│  ├── Collection: document_chunks（全局单一Collection）       │
 │  ├── Index: HNSW(COSINE) + SPARSE_INVERTED_INDEX             │
-│  └── Partition: 按permission_level或kb_id动态分区              │
+│  └── Partition: 按 kb_id 动态分区，分区名 `kb_{kb_id}`       │
 ├─────────────────────────────────────────────────────────────┤
 │  Redis Cluster 7.x                                          │
 │  ├── 缓存：Query结果、Embedding、会话上下文                    │
@@ -184,13 +193,11 @@ erDiagram
 
 ```mermaid
 erDiagram
-    COLLECTION_KB_001 ||--o{ PARTITION_PUBLIC : "contains"
-    COLLECTION_KB_001 ||--o{ PARTITION_TEAM : "contains"
-    COLLECTION_KB_001 ||--o{ PARTITION_PRIVATE : "contains"
+    COLLECTION_DOCUMENT_CHUNKS ||--o{ PARTITION_KB_N : "contains"
+    COLLECTION_DOCUMENT_CHUNKS ||--o{ PARTITION_KB_M : "contains"
 
-    PARTITION_PUBLIC ||--o{ CHUNK_VECTOR : "stores"
-    PARTITION_TEAM ||--o{ CHUNK_VECTOR : "stores"
-    PARTITION_PRIVATE ||--o{ CHUNK_VECTOR : "stores"
+    PARTITION_KB_N ||--o{ CHUNK_VECTOR : "stores"
+    PARTITION_KB_M ||--o{ CHUNK_VECTOR : "stores"
 
     CHUNK_VECTOR {
         int64 id PK "auto_id"
@@ -203,6 +210,8 @@ erDiagram
         json metadata "{page_num, section_title, token_count}"
     }
 ```
+
+> **说明**：全局采用单一 Collection `document_chunks`，按知识库 ID 动态创建 Partition `kb_{kb_id}` 实现物理隔离，避免每知识库独立 Collection 带来的运维复杂度。
 
 ---
 
@@ -323,7 +332,7 @@ CREATE INDEX idx_user_roles_team ON user_roles(team_id) WHERE team_id IS NOT NUL
 | owner_id | UUID | - | NO | - | FK | 普通索引 | 所有者 |
 | default_permission | VARCHAR | 20 | NO | 'team' | CHECK | - | personal/team/public/custom |
 | config | JSONB | - | NO | '{}' | - | GIN索引 | 分块策略、Embedding模型配置 |
-| vector_collection_name | VARCHAR | 100 | YES | - | - | 唯一索引 | 关联的Milvus Collection名 |
+| vector_partition_name | VARCHAR | 100 | YES | - | - | 唯一索引 | 关联的Milvus Partition名（固定为 `kb_{kb_id}`，保留字段便于运维查询） |
 | status | VARCHAR | 20 | NO | 'active' | CHECK | 普通索引 | active/archived/deleted |
 | total_docs | INT | - | NO | 0 | - | - | 文档总数（缓存） |
 | total_chunks | INT | - | NO | 0 | - | - | 分块总数（缓存） |
@@ -352,7 +361,8 @@ CREATE INDEX idx_user_roles_team ON user_roles(team_id) WHERE team_id IS NOT NUL
 | storage_path | VARCHAR | 500 | NO | - | - | - | 对象存储路径 |
 | storage_hash | VARCHAR | 64 | NO | - | - | - | 文件SHA256哈希 |
 | uploader_id | UUID | - | NO | - | FK | 普通索引 | 上传者 |
-| status | VARCHAR | 30 | NO | 'UPLOADED' | CHECK | 普通索引 | 状态枚举 |
+| processing_status | VARCHAR | 30 | NO | 'UPLOADED' | CHECK | 普通索引 | 文档处理状态（瞬态/终态） |
+| lifecycle_status | VARCHAR | 20 | NO | 'ACTIVE' | CHECK | 普通索引 | 文档生命周期状态 |
 | permission_level | VARCHAR | 20 | NO | 'team' | CHECK | - | personal/team/public/custom |
 | custom_permissions | JSONB | - | YES | '[]' | - | - | 自定义权限列表 |
 | metadata | JSONB | - | YES | '{}' | - | GIN索引 | 标题/作者/创建日期等元数据 |
@@ -375,16 +385,32 @@ CREATE INDEX idx_user_roles_team ON user_roles(team_id) WHERE team_id IS NOT NUL
 
 **状态约束**：
 ```sql
-CHECK (status IN (
-    'UPLOADED', 'PARSING', 'CHUNKED', 'INDEXING', 
-    'INDEXED', 'PARTIAL_INDEXED', 'FAILED', 
-    'UPDATING', 'ARCHIVED', 'DELETING', 'DELETED'
+-- processing_status：文档解析、分块、索引等处理状态
+CHECK (processing_status IN (
+    'UPLOADED',       -- 已上传，等待解析
+    'PARSING',        -- 解析中
+    'CHUNKED',        -- 分块完成
+    'INDEXING',       -- 索引构建中
+    'INDEXED',        -- 索引完成（成功终态）
+    'PARTIAL_INDEXED',-- 部分索引成功（运营可介入）
+    'FAILED',         -- 处理失败（失败终态）
+    'UPDATING'        -- 版本更新中
+))
+
+-- lifecycle_status：文档生命周期状态
+CHECK (lifecycle_status IN (
+    'ACTIVE',         -- 正常可用
+    'ARCHIVED',       -- 已归档
+    'DELETING',       -- 删除中（异步清理）
+    'DELETED'         -- 已删除（软删除标记）
 ))
 ```
 
+> **说明**：`processing_status` 与 `lifecycle_status` 正交，分别描述处理流与生命周期。`CHECK` 约束同时包含瞬态与终态，应用层负责状态机校验与终态守护。
+
 **索引策略**：
 ```sql
-CREATE INDEX idx_documents_kb_status ON documents(kb_id, status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_documents_kb_status ON documents(kb_id, processing_status, lifecycle_status) WHERE deleted_at IS NULL;
 CREATE INDEX idx_documents_uploader ON documents(uploader_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_documents_category ON documents(category_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_documents_file_type ON documents(file_type) WHERE deleted_at IS NULL;
@@ -420,8 +446,8 @@ CREATE INDEX idx_documents_created_at ON documents USING BRIN(created_at);
 | id | UUID | - | NO | gen_random_uuid() | PK | 主键 | 分块唯一标识 |
 | doc_id | UUID | - | NO | - | FK | 普通索引 | 所属文档 |
 | chunk_index | INT | - | NO | - | - | - | 分块序号（文档内） |
-| content | TEXT | - | NO | - | - | - | 原始文本内容 |
-| content_masked | TEXT | - | YES | - | - | - | 脱敏后文本（入向量索引） |
+| content | TEXT | - | NO | - | - | - | 原始文本内容（AES-256加密存储） |
+| content_masked | TEXT | - | YES | - | - | - | 脱敏后文本，用于全文检索（FTS）与前端展示 |
 | char_count | INT | - | NO | 0 | - | - | 字符数 |
 | token_count | INT | - | NO | 0 | - | - | Token数 |
 | page_num | INT | - | YES | - | - | - | 所在页码 |
@@ -429,10 +455,10 @@ CREATE INDEX idx_documents_created_at ON documents USING BRIN(created_at);
 | section_level | INT | - | YES | - | - | - | 标题层级H1-H6 |
 | chunk_type | VARCHAR | 20 | NO | 'text' | - | - | text/table/code/image_desc |
 | metadata | JSONB | - | YES | '{}' | - | GIN索引 | 扩展元数据 |
-| embedding_model | VARCHAR | 50 | YES | - | - | - | Embedding模型名 |
-| embedding_version | VARCHAR | 20 | YES | - | - | - | 模型版本 |
-| vector_id | VARCHAR | 50 | YES | - | - | - | Milvus向量ID（关联） |
-| fts_vector | TSVECTOR | - | YES | - | - | GIN索引 | 全文检索向量 |
+| embedding_model | VARCHAR | 50 | YES | - | - | 普通索引 | Embedding模型名（如 BGE-M3） |
+| embedding_version | VARCHAR | 20 | YES | - | - | 普通索引 | 模型版本号，支持多版本并存与渐进式重索引 |
+| vector_id | VARCHAR | 50 | YES | - | UK | 唯一索引 | Milvus 向量 ID（`document_chunks.id` INT64 的字符串映射） |
+| fts_vector | TSVECTOR | - | YES | - | - | GIN索引 | 全文检索向量，基于 `content_masked` 生成 |
 | status | VARCHAR | 20 | NO | 'active' | CHECK | - | active/updated/deleted |
 | created_at | TIMESTAMP | - | NO | NOW() | - | - | 创建时间 |
 | updated_at | TIMESTAMP | - | NO | NOW() | - | - | 更新时间 |
@@ -441,6 +467,8 @@ CREATE INDEX idx_documents_created_at ON documents USING BRIN(created_at);
 ```sql
 CREATE UNIQUE INDEX idx_chunks_doc_index ON document_chunks(doc_id, chunk_index) WHERE status = 'active';
 CREATE INDEX idx_chunks_doc ON document_chunks(doc_id) WHERE status = 'active';
+CREATE UNIQUE INDEX idx_chunks_vector_id ON document_chunks(vector_id) WHERE vector_id IS NOT NULL;
+CREATE INDEX idx_chunks_embedding_model ON document_chunks(embedding_model, embedding_version);
 CREATE INDEX idx_chunks_fts ON document_chunks USING GIN(fts_vector);
 CREATE INDEX idx_chunks_metadata ON document_chunks USING GIN(metadata);
 ```
@@ -561,7 +589,7 @@ CREATE INDEX idx_conversations_last_msg ON conversations(last_message_at DESC) W
 | conversation_id | UUID | - | NO | - | FK | 普通索引 | 所属会话 |
 | role | VARCHAR | 20 | NO | - | CHECK | - | user/assistant/system/tool |
 | content | TEXT | - | NO | - | - | - | 消息内容（AES加密存储） |
-| content_plain_hash | VARCHAR | 64 | YES | - | - | - | 明文哈希（用于去重检测） |
+| content_plain_hash | VARCHAR | 64 | YES | - | - | - | 明文哈希，用于消息去重检测；注意：在敏感场景下会泄露“内容是否相同”的信息，可改用 HMAC/加密哈希替代 |
 | message_type | VARCHAR | 50 | NO | 'text' | - | - | text/image/file/tool_result |
 | citations | JSONB | - | YES | '[]' | - | GIN索引 | 引用快照 [{id, doc_id, chunk_id, relevance}] |
 | feedback_id | UUID | - | YES | - | FK | 普通索引 | 关联反馈ID |
@@ -580,12 +608,17 @@ CREATE INDEX idx_conversations_last_msg ON conversations(last_message_at DESC) W
 
 **索引策略**：
 ```sql
+-- 覆盖会话消息列表高频查询（按会话 + 时间倒序）
 CREATE INDEX idx_messages_conv ON conversation_messages(conversation_id, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX idx_messages_feedback ON conversation_messages(feedback_id) WHERE feedback_id IS NOT NULL;
 CREATE INDEX idx_messages_parent ON conversation_messages(parent_message_id) WHERE parent_message_id IS NOT NULL;
 CREATE INDEX idx_messages_citations ON conversation_messages USING GIN(citations) WHERE citations IS NOT NULL;
 CREATE INDEX idx_messages_model ON conversation_messages(model_used, created_at) WHERE deleted_at IS NULL;
 ```
+
+**约束说明**：
+- 主键 `(id)` 已保证消息唯一性；`parent_message_id` 建议由应用层在写入前进行祖先链路校验，防止消息树成环。
+- 分支场景下，`branch_from_id` 指向历史消息快照，删除源消息时不对分支消息级联删除。
 
 ---
 
@@ -771,7 +804,31 @@ CREATE INDEX idx_citations_created ON citations(created_at);
 
 ---
 
-### 5.7 Agent记忆模块
+#### 5.6.4 standard_answers（修正答案库表）
+
+| 字段名 | 数据类型 | 长度/精度 | 可空 | 默认值 | 约束 | 索引 | 说明 |
+|--------|----------|-----------|------|--------|------|------|------|
+| id | UUID | - | NO | gen_random_uuid() | PK | 主键 | 标准答案唯一标识 |
+| feedback_id | UUID | - | YES | - | FK | 普通索引 | 关联反馈（可为空） |
+| query_pattern | VARCHAR | 500 | NO | - | - | 普通索引 | 问题匹配模式（支持模糊/正则） |
+| answer | TEXT | - | NO | - | - | - | 修正后的标准答案 |
+| citations | JSONB | - | YES | '[]' | - | GIN索引 | 引用来源快照 [{doc_id, chunk_id, relevance}] |
+| similarity_threshold | FLOAT | - | NO | 0.9 | CHECK | - | 命中阈值（0-1） |
+| usage_count | INT | - | NO | 0 | - | - | 命中使用次数 |
+| created_at | TIMESTAMP | - | NO | NOW() | - | 普通索引 | 创建时间 |
+| updated_at | TIMESTAMP | - | NO | NOW() | - | - | 更新时间 |
+
+**唯一约束**：`(query_pattern)`
+
+**索引策略**：
+```sql
+CREATE UNIQUE INDEX idx_standard_answers_pattern ON standard_answers(query_pattern);
+CREATE INDEX idx_standard_answers_feedback ON standard_answers(feedback_id) WHERE feedback_id IS NOT NULL;
+```
+
+---
+
+## 5.7 Agent记忆模块
 
 #### 5.7.1 user_entities（用户实体记忆表）
 
@@ -814,8 +871,8 @@ CREATE INDEX idx_citations_created ON citations(created_at);
 | 字段名 | 数据类型 | 长度/精度 | 可空 | 默认值 | 约束 | 索引 | 说明 |
 |--------|----------|-----------|------|--------|------|------|------|
 | id | UUID | - | NO | gen_random_uuid() | PK | 主键 | 日志ID |
-| trace_id | VARCHAR | 64 | NO | - | UK | 唯一索引 | 全链路TraceID |
-| event_at | TIMESTAMP | - | NO | NOW() | - | 主键/分区键 | 事件时间 |
+| trace_id | VARCHAR | 64 | NO | - | - | 普通索引 | 全链路TraceID（同一TraceID可被多服务多次记录，不唯一） |
+| event_at | TIMESTAMP | - | NO | NOW() | PK | 主键/分区键 | 事件时间 |
 | event_type | VARCHAR | 50 | NO | - | - | 普通索引 | 事件类型 |
 | event_category | VARCHAR | 50 | NO | - | - | - | auth/document/conversation/admin/system |
 | user_id | UUID | - | YES | - | FK | 普通索引 | 用户ID |
@@ -833,6 +890,8 @@ CREATE INDEX idx_citations_created ON citations(created_at);
 | geo_location | JSONB | - | YES | '{}' | - | - | 地理位置信息 |
 | session_id | VARCHAR | 100 | YES | - | - | - | 会话标识 |
 | created_at | TIMESTAMP | - | NO | NOW() | - | - | 入库时间 |
+
+> **主键设计**：分区表主键为 `(event_at, id)` 复合主键，使分区裁剪与按时间范围查询更高效；`id` 保证单分区内的唯一性。
 
 **分区策略**：
 ```sql
@@ -854,7 +913,7 @@ CREATE INDEX idx_audit_user ON audit_logs(user_id, event_at DESC);
 CREATE INDEX idx_audit_type ON audit_logs(event_type, event_at DESC);
 CREATE INDEX idx_audit_risk ON audit_logs(risk_level, event_at DESC) WHERE risk_level IN ('high', 'critical');
 CREATE INDEX idx_audit_object ON audit_logs(object_type, object_id);
-CREATE INDEX idx_audit_trace ON audit_logs(trace_id);
+CREATE INDEX idx_audit_trace ON audit_logs(trace_id);  -- 普通索引，非唯一
 ```
 
 **归档策略**：
@@ -884,6 +943,13 @@ CREATE INDEX idx_audit_trace ON audit_logs(trace_id);
 | created_at | TIMESTAMP | - | NO | NOW() | - | 分区键 | 创建时间 |
 
 **分区策略**：同audit_logs，按`created_at`月度RANGE分区。
+
+**索引策略**：
+```sql
+CREATE INDEX idx_token_usage_provider_model ON token_usage_logs(provider, model_name, created_at);
+CREATE INDEX idx_token_usage_user ON token_usage_logs(user_id, created_at DESC);
+CREATE INDEX idx_token_usage_request ON token_usage_logs(request_id);
+```
 
 ---
 
@@ -954,9 +1020,62 @@ CREATE INDEX idx_audit_trace ON audit_logs(trace_id);
 
 ---
 
+#### 5.9.4 prompt_templates（提示词模板表）
+
+| 字段名 | 数据类型 | 长度/精度 | 可空 | 默认值 | 约束 | 索引 | 说明 |
+|--------|----------|-----------|------|--------|------|------|------|
+| id | UUID | - | NO | gen_random_uuid() | PK | 主键 | 模板唯一标识 |
+| kb_id | UUID | - | YES | - | FK | 普通索引 | 所属知识库（全局为空） |
+| scope | VARCHAR | 20 | NO | 'global' | CHECK | 普通索引 | 作用域：personal/team/global |
+| name | VARCHAR | 100 | NO | - | - | - | 模板名称 |
+| content | TEXT | - | NO | - | - | - | 提示词内容 |
+| variables | JSONB | - | YES | '[]' | - | - | 模板变量定义 [{name, required, default}] |
+| created_by | UUID | - | NO | - | FK | 普通索引 | 创建人 |
+| status | VARCHAR | 20 | NO | 'active' | CHECK | 普通索引 | active/pending/rejected |
+| created_at | TIMESTAMP | - | NO | NOW() | - | 普通索引 | 创建时间 |
+| updated_at | TIMESTAMP | - | NO | NOW() | - | - | 更新时间 |
+
+**唯一约束**：`(kb_id, scope, name)`（scope=global 时 kb_id 为 NULL 需用部分索引）
+
+**索引策略**：
+```sql
+CREATE UNIQUE INDEX idx_prompt_templates_scope_name ON prompt_templates(kb_id, scope, name);
+CREATE INDEX idx_prompt_templates_kb ON prompt_templates(kb_id) WHERE kb_id IS NOT NULL;
+CREATE INDEX idx_prompt_templates_status ON prompt_templates(status);
+```
+
+---
+
+#### 5.9.5 model_provider_configs（模型提供商配置表）
+
+| 字段名 | 数据类型 | 长度/精度 | 可空 | 默认值 | 约束 | 索引 | 说明 |
+|--------|----------|-----------|------|--------|------|------|------|
+| id | UUID | - | NO | gen_random_uuid() | PK | 主键 | 配置唯一标识 |
+| provider_name | VARCHAR | 50 | NO | - | - | 普通索引 | 提供商名称：openai/zhipu/qwen/kimi/ollama |
+| api_base | VARCHAR | 500 | YES | - | - | - | API Base URL |
+| priority | INT | - | NO | 1 | - | 普通索引 | 优先级（越小越优先） |
+| is_active | BOOLEAN | - | NO | true | - | 普通索引 | 是否启用 |
+| rate_limit | JSONB | - | YES | '{}' | - | - | 限流配置 {requests_per_minute, tokens_per_minute} |
+| cost_per_1k_input | DECIMAL | 10,6 | NO | 0 | - | - | 每1K输入Token费用（元） |
+| cost_per_1k_output | DECIMAL | 10,6 | NO | 0 | - | - | 每1K输出Token费用（元） |
+| created_at | TIMESTAMP | - | NO | NOW() | - | - | 创建时间 |
+| updated_at | TIMESTAMP | - | NO | NOW() | - | - | 更新时间 |
+
+**唯一约束**：`(provider_name)`
+
+**索引策略**：
+```sql
+CREATE UNIQUE INDEX idx_model_provider_name ON model_provider_configs(provider_name);
+CREATE INDEX idx_model_provider_active_priority ON model_provider_configs(is_active, priority);
+```
+
+---
+
 ### 5.10 异步任务模块
 
 #### 5.10.1 task_queue（任务队列表）
+
+> **定位说明**：本表是 Celery 任务的**同步运营视图**，供管理后台查询任务状态与统计；实际任务调度、Broker 与消费者仍由 Celery + Redis 负责，禁止直接通过本表派发或控制任务。
 
 | 字段名 | 数据类型 | 长度/精度 | 可空 | 默认值 | 约束 | 索引 | 说明 |
 |--------|----------|-----------|------|--------|------|------|------|
@@ -988,6 +1107,8 @@ CREATE INDEX idx_task_trace ON task_queue(trace_id);
 ---
 
 ## 六、向量数据库设计（Milvus）
+
+> **最终方案**：全局使用单一 Collection `document_chunks`，按知识库动态创建 Partition `kb_{kb_id}` 实现租户物理隔离，避免按知识库独立 Collection 导致的索引、运维与资源开销。
 
 ### 6.1 Collection设计
 
@@ -1032,8 +1153,8 @@ Collection: document_chunks
 
 | 隔离级别 | 方案 | 适用场景 | 优缺点 |
 |----------|------|----------|--------|
-| **Collection级** | 每个知识库独立Collection | 高安全要求（金融/政企） | 资源开销大，管理复杂，物理隔离最彻底 |
-| **Partition级** | 单Collection + 按kb_id分区 | 中等规模（推荐） | 平衡性能与隔离，Milvus原生支持 |
+| **Collection级** | 每个知识库独立Collection | 特殊高安全要求（金融/政企） | 资源开销大，管理复杂，物理隔离最彻底；非本设计默认方案 |
+| **Partition级** | 单Collection + 按kb_id动态分区 `kb_{kb_id}` | 本系统最终方案 | 平衡性能与隔离，Milvus原生支持，推荐生产使用 |
 | **Metadata过滤** | 单Collection + 表达式过滤 | 小规模/快速启动 | 性能随数据量下降，不推荐生产环境 |
 
 **推荐方案**：Partition级隔离
@@ -1061,7 +1182,7 @@ client.search(
 
 | 数据类型 | Key模式 | 数据结构 | TTL | 说明 |
 |----------|---------|----------|-----|------|
-| **Query结果缓存** | `sk:query:{hash(query+kb_ids+mode)}` | String(JSON) | 5min | 相似Query缓存复用 |
+| **Query结果缓存** | `sk:query:{user_id}:{hash(query+kb_ids+mode)}` | String(JSON) | 5min | 相似Query缓存复用；必须包含用户维度，防止跨用户数据泄露 |
 | **Embedding缓存** | `sk:emb:{hash(text+model_version)}` | String(JSON) | 24h | 相同文本Embedding复用 |
 | **会话上下文** | `sk:conv:{conversation_id}` | List(JSON) | 24h | 最近10轮对话 |
 | **用户配额** | `sk:quota:{user_id}:{dimension}` | Hash | 按维度周期 | 实时配额计数 |
@@ -1071,6 +1192,9 @@ client.search(
 | **失败计数** | `sk:fail:{user_id}:{event}` | String | 15min | 登录失败等计数 |
 | **在线状态** | `sk:online:{user_id}` | String | 5min | 用户在线状态（心跳续期） |
 | **模型熔断** | `sk:circuit:{provider}` | String | 60s | 熔断器状态 |
+| **Celery Broker** | Celery 内部前缀（默认 `celery:`） | List/Hash/Set | 按任务 | 由 Celery 自行管理，与应用缓存 Key 空间隔离 |
+
+> **注意**：Celery 使用 Redis 作为 Broker 与 Result Backend，其 Key 前缀（默认 `celery:`）与上述应用缓存 Key（`sk:`）分离，禁止业务代码直接读写 Celery 内部 Key。
 
 ### 7.2 配额计数器实现
 
@@ -1129,7 +1253,7 @@ EXPIREAT sk:quota:{user_id}:monthly_tokens {次月1号时间戳}
 | **分区表** | 海量日志数据 | audit_logs/token_usage_logs按月RANGE分区 |
 | **BRIN索引** | 时间序列数据 | users/conversations创建时间使用BRIN索引 |
 | **GIN索引** | JSONB/数组/全文检索 | metadata/tags/citations字段 |
-| **覆盖索引** | 高频列表查询 | documents(kb_id, status, created_at)包含查询字段 |
+| **覆盖索引** | 高频列表查询 | documents(kb_id, processing_status, lifecycle_status, created_at)包含查询字段 |
 | **预编译语句** | 重复查询模式 | 使用PostgreSQL Prepared Statement |
 
 ### 9.2 向量检索优化
@@ -1200,12 +1324,17 @@ CREATE TABLE user_entities (...);
 CREATE TABLE feedbacks (...);
 CREATE TABLE bad_cases (...);
 CREATE TABLE bad_case_analysis (...);
+CREATE TABLE standard_answers (...);
 
 -- 7. 系统管理与审计
 CREATE TABLE audit_logs (...);  -- 分区表
 CREATE TABLE token_usage_logs (...);  -- 分区表
 CREATE TABLE quota_usage_logs (...);
 CREATE TABLE task_queue (...);
+
+-- 8. 系统配置与模型网关
+CREATE TABLE prompt_templates (...);
+CREATE TABLE model_provider_configs (...);
 ```
 
 ### 10.2 核心约束与触发器
@@ -1228,13 +1357,19 @@ CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 CREATE OR REPLACE FUNCTION audit_document_change()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF OLD.status IS DISTINCT FROM NEW.status THEN
+    IF OLD.processing_status IS DISTINCT FROM NEW.processing_status
+       OR OLD.lifecycle_status IS DISTINCT FROM NEW.lifecycle_status THEN
         INSERT INTO audit_logs (trace_id, event_at, event_type, user_id, 
             object_type, object_id, object_name, action_result, request_params)
         VALUES (
             gen_random_uuid(), NOW(), 'document:status_change', NEW.uploader_id,
             'document', NEW.id, NEW.filename, 'success',
-            jsonb_build_object('old_status', OLD.status, 'new_status', NEW.status)
+            jsonb_build_object(
+                'old_processing_status', OLD.processing_status,
+                'new_processing_status', NEW.processing_status,
+                'old_lifecycle_status', OLD.lifecycle_status,
+                'new_lifecycle_status', NEW.lifecycle_status
+            )
         );
     END IF;
     RETURN NEW;
@@ -1252,7 +1387,7 @@ CREATE TRIGGER trg_document_audit AFTER UPDATE ON documents
 | 序号 | 事项 | 影响范围 | 建议决策时点 |
 |------|------|----------|--------------|
 | 1 | 向量数据库选型确认（Milvus vs Qdrant） | 架构、部署、运维 | MVP启动前 |
-| 2 | 是否需要Collection级物理隔离 | 资源成本、安全等级 | 安全评审后 |
+| 2 | 向量隔离方案已确认 | 采用单Collection + 按kb_id动态Partition `kb_{kb_id}`；Collection级隔离作为未来特殊场景可选项 | 架构评审后 |
 | 3 | 分库分表触发条件与方案 | 架构扩展性 | 数据量达到50万文档时 |
 | 4 | 冷数据归档自动化脚本 | 存储成本、查询性能 | M2阶段 |
 | 5 | 审计日志区块链存证（P3） | 合规成本 | M4阶段评估 |

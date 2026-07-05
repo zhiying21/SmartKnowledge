@@ -1,9 +1,9 @@
 # 智知库（SmartKnowledge）功能规格文档（FSD）
 
-> **文档版本**：v1.0  
+> **文档版本**：v1.1  
 > **基于PRD版本**：v2.0  
 > **生成日期**：2026-07-05  
-> **文档状态**：技术评审中  
+> **文档状态**：评审后修订  
 > **密级**：内部公开  
 > **目标读者**：后端开发、前端开发、测试工程师、架构师、DevOps
 
@@ -145,7 +145,7 @@ flowchart TB
 2. 文件持久化
    2.1 生成文件唯一标识：doc_id = UUIDv4
    2.2 存储至对象存储：/raw/{kb_id}/{doc_id}/{filename}
-   2.3 写入文档元数据表（documents），状态=UPLOADED
+   2.3 写入文档元数据表（documents），processing_status=PENDING，lifecycle_status=ACTIVE
 
 3. 异步任务投递
    3.1 构建解析任务Payload：{doc_id, file_path, file_type, kb_id, uploader_id}
@@ -172,7 +172,7 @@ flowchart TB
 5. Embedding与索引构建
    5.1 批量调用Embedding模型（BGE-M3），batch_size=32
    5.2 检查Embedding缓存：相同文本的Embedding结果缓存24小时
-   5.3 写入向量数据库：collection按kb_id隔离（多租户物理隔离）
+   5.3 写入向量数据库：单Collection + 按kb_id Partition隔离（多租户物理隔离）
    5.4 写入稀疏索引：PostgreSQL全文检索表（document_chunks_fts）
    5.5 更新状态：INDEXED
    5.6 发送通知：WebSocket推送 / 邮件 / 站内信（按用户配置）
@@ -187,7 +187,8 @@ flowchart TB
 |------|------|------|
 | doc_id | UUID | 文档唯一标识 |
 | task_id | UUID | 异步任务ID |
-| status | enum | UPLOADED / PARSING / CHUNKED / INDEXING / INDEXED / FAILED |
+| processing_status | enum | PENDING / PARSING / CHUNKED / INDEXING / INDEXED / PARTIAL / FAILED |
+| lifecycle_status | enum | ACTIVE / ARCHIVED / DELETING / DELETED |
 | estimated_time | int | 预估处理秒数 |
 | uploaded_at | ISO8601 | 上传时间 |
 
@@ -204,7 +205,7 @@ flowchart TB
 | PDF受密码保护 | E-DM-002 | 标记FAILED，提示用户解除密码后重新上传 |
 | 扫描件OCR失败 | E-DM-003 | 标记FAILED，建议用户上传可搜索PDF |
 | 病毒扫描阳性 | E-DM-004 | 立即隔离文件，告警管理员，通知上传者 |
-| 向量数据库写入超时 | E-DM-005 | 重试3次，仍失败则标记PARTIAL_INDEXED，人工介入 |
+| 向量数据库写入超时 | E-DM-005 | 重试3次，仍失败则标记processing_status=PARTIAL，人工介入 |
 | Embedding服务熔断 | E-DM-006 | 降级至备用Embedding模型，记录降级事件 |
 
 ---
@@ -217,7 +218,7 @@ flowchart TB
 |------|------|------|
 | kb_id | UUID | 必填 |
 | keyword | string | 可选，≤100字符 |
-| filters | JSON | 可选：{file_type, uploader_id, date_range, tags, status} |
+| filters | JSON | 可选：{file_type, uploader_id, date_range, tags, processing_status, lifecycle_status} |
 | sort_by | enum | 默认upload_time_desc，可选name/size/upload_time |
 | page | int | ≥1，默认1 |
 | page_size | int | 10-100，默认20 |
@@ -244,16 +245,16 @@ flowchart TB
 **状态流转**：
 ```mermaid
 stateDiagram-v2
-    [*] --> UPLOADED: 上传完成
-    UPLOADED --> PARSING: 开始解析
+    [*] --> PENDING: 上传完成
+    PENDING --> PARSING: 开始解析
     PARSING --> CHUNKED: 分块完成
     CHUNKED --> INDEXING: 开始索引
     INDEXING --> INDEXED: 索引完成
-    INDEXING --> PARTIAL_INDEXED: 部分索引失败
+    INDEXING --> PARTIAL: 部分索引失败
     PARSING --> FAILED: 解析失败
     CHUNKED --> FAILED: Embedding失败
     INDEXING --> FAILED: 向量写入失败
-    PARTIAL_INDEXED --> INDEXED: 人工修复后重试
+    PARTIAL --> INDEXED: 人工修复后重试
     FAILED --> PARSING: 手动重试（最多3次）
     INDEXED --> ARCHIVED: 自动归档（90天未使用）
     INDEXED --> UPDATING: 上传新版本
@@ -264,9 +265,11 @@ stateDiagram-v2
     DELETED --> [*]
 ```
 
+> 注：为便于展示，本状态机将 `processing_status`（处理状态）与 `lifecycle_status`（生命周期状态）合并绘制；实际数据模型中二者为独立字段。
+
 **删除副作用**：
 ```
-1. 软删除：documents表标记status=DELETING，保留元数据30天
+1. 软删除：documents表标记lifecycle_status=DELETING，保留元数据30天
 2. 向量清理：异步任务删除VectorDB中该doc_id的所有chunk
 3. 缓存清理：清除Redis中该文档的Embedding缓存和Query缓存
 4. 关联清除：清除对话中引用该文档的缓存上下文（标记"知识库已更新"）
@@ -565,7 +568,7 @@ flowchart LR
 
 ### 3.3 AI Agent模块
 
-#### 3.3.1 Agent自动拆解复杂问题（US-201）【P0】
+#### 3.3.1 Agent自动拆解复杂问题（US-201）【P1】
 
 **功能编号**：F-AGT-001  
 **功能名称**：Plan-and-Execute Agent  
@@ -578,7 +581,7 @@ flowchart LR
 | conversation_id | UUID | 会话ID |
 | available_tools | string[] | 用户启用的工具列表（默认全部） |
 | max_steps | int | 最大执行步骤，默认10 |
-| timeout | int | 超时秒数，默认30 |
+| timeout | int | 超时秒数，默认60 |
 | memory_context | JSON | Agent记忆（用户偏好、历史实体） |
 
 **Agent状态机**：
@@ -634,9 +637,9 @@ stateDiagram-v2
      3.2 调用指定工具：
          - document_search: 调用RAG Pipeline（F-RAG-001），限定检索范围
          - web_search: 调用外部搜索API（需管理员开启）
-         - calculator: 执行Python表达式（沙箱环境，禁止系统调用）
+         - calculator: 受限Python eval沙箱，仅允许数学表达式；禁止import、__import__、os、subprocess、open、eval、exec、compile等危险调用
          - database_query: 查询结构化数据（只读权限，SQL注入防护）
-         - code_interpreter: 执行Python代码（P2，隔离容器）
+         - code_interpreter: 执行Python代码（P2），使用Docker隔离容器，禁止网络与系统调用；与calculator不是同一沙箱
      3.3 记录工具调用日志：{step_id, tool, input, output_summary, latency, cost}
      3.4 将结果存入短期记忆（Short-term Buffer）
 
@@ -655,6 +658,8 @@ stateDiagram-v2
    若retry_count >= 2:
      → 标记为低置信度，追加免责声明
 
+> 注：Self-Reflection为可选增强能力，非Agent执行的强制阻塞节点；初期实现可关闭该步骤以简化流程、降低延迟。
+
 5. 答案组装（Answer Assembler）
    输入：所有步骤结果 + reflection_report
    处理：
@@ -666,7 +671,7 @@ stateDiagram-v2
 
 6. 超时与降级管理
    监控：每5秒检查总耗时
-   若耗时 > timeout（默认30秒）：
+   若耗时 > timeout（默认60秒）：
    - 中断当前执行
    - 使用已完成的步骤结果生成"部分答案"
    - 标记"由于复杂度，部分分析未完成"
@@ -687,7 +692,7 @@ stateDiagram-v2
 
 ---
 
-#### 3.3.2 工具调用（Tool Use）（US-202）【P0】
+#### 3.3.2 工具调用（Tool Use）（US-202）【P1】
 
 **功能编号**：F-AGT-002  
 **工具注册表（Tool Registry）**：
@@ -696,9 +701,11 @@ stateDiagram-v2
 |--------|------|----------|----------|----------|
 | document_search | 内部 | {query, kb_ids, filters} | 权限隔离 | 返回"知识库无答案" |
 | web_search | 外部 | {query, max_results} | 需管理员开启 | 跳过并告知用户 |
-| calculator | 沙箱 | {expression} | Python eval沙箱，禁止import os/subprocess | 返回计算错误提示 |
+| calculator | 沙箱 | {expression} | 受限Python eval沙箱：仅数学表达式；禁止import、__import__、os、subprocess、open、eval、exec、compile | 返回计算错误提示 |
 | database_query | 内部 | {sql, params} | 只读连接池，SQL白名单 | 返回查询失败提示 |
-| code_interpreter | 隔离 | {code, timeout} | Docker隔离容器，无网络，CPU限制 | 跳过工具 |
+| code_interpreter | 隔离 | {code, timeout} | Docker隔离容器（P2），无网络，CPU限制；与calculator沙箱相互独立 | 跳过工具 |
+
+**注**：calculator仅用于数学/数值计算；code_interpreter（P2）使用Docker隔离，二者安全边界不同，不得互相替代。
 
 **工具调用流程**：
 ```mermaid
@@ -725,7 +732,7 @@ sequenceDiagram
 
 ---
 
-#### 3.3.3 Agent记忆管理（US-204）【P0】
+#### 3.3.3 Agent记忆管理（US-204）【P1】
 
 **功能编号**：F-AGT-003  
 **记忆分层架构**：
@@ -1005,7 +1012,7 @@ erDiagram
 
 2. 数据级鉴权（Data-level ACL）
    - 文档查询：自动附加 WHERE (doc.permission_level='public' OR doc.uploader_id=? OR ? = ANY(doc.team_ids))
-   - 向量检索：在检索阶段过滤无权限的chunk（通过Milvus的partition过滤或metadata过滤）
+   - 向量检索：在检索阶段过滤无权限的chunk（单Collection内按kb_id Partition过滤，再结合doc_id列表做metadata二次校验）
    - 对话隔离：WHERE conversation.user_id=?
 
 3. 字段级鉴权（Field-level）
@@ -1092,9 +1099,8 @@ sequenceDiagram
 | 修改权限 | 上传者 | 团队管理员 | 系统管理员 | 系统管理员 | 管理员 |
 
 **向量隔离策略**：
-- 方案A（推荐）：按知识库创建独立Collection（Milvus）/ Index（Qdrant），查询时指定collection
-- 方案B：单Collection + metadata过滤（kb_id + permission_level），性能略低但管理简单
-- 方案C：混合方案（公开文档共享Collection，敏感文档独立Collection）
+- 最终方案：单Collection + 按kb_id Partition隔离（Milvus）/ 等价隔离方案（Qdrant），查询时指定kb_id对应的Partition，并结合doc_id列表做metadata权限过滤。
+- 不再采用每知识库独立Collection或混合方案，以降低运维复杂度并保证查询性能。
 
 ---
 
@@ -1225,6 +1231,10 @@ PENDING → RECEIVED → STARTED → SUCCESS / FAILURE / RETRY
                     ↳ FAILURE → DEAD_LETTER（人工介入）
 ```
 
+**任务队列与数据库表的关系**：
+- Celery是唯一的任务执行与调度引擎，Redis作为Broker和Result Backend。
+- 数据库中的`task_queue`表仅作为运营只读视图，通过Celery事件流同步，不直接参与任务调度，也不允许业务代码直接写入或修改。
+
 ---
 
 #### 3.7.2 系统监控与告警（US-602）【P1】
@@ -1298,7 +1308,7 @@ CIRCUIT_BREAKER_CONFIG = {
 ```
 
 **缓存策略**：
-- Query结果缓存：Redis，Key=hash(query+kb_ids+search_mode)，TTL=5min
+- Query结果缓存：Redis，Key=hash(user_id + query + kb_ids + search_mode + user_permission_scope)，命名空间 `sk:query:{user_id}:{hash}`，TTL=5min。必须按用户维度隔离，防止跨用户缓存泄露。
 - Embedding缓存：Redis，Key=hash(text+model_version)，TTL=24h
 - 模型响应缓存：仅缓存简单事实问答（confidence>0.9），TTL=1h
 
@@ -1829,7 +1839,8 @@ erDiagram
         int page_count
         string storage_path
         UUID uploader_id FK
-        enum status "uploaded/parsing/chunked/indexing/indexed/failed/archived/deleted"
+        enum processing_status "pending/parsing/chunked/indexing/indexed/partial/failed"
+        enum lifecycle_status "active/archived/deleting/deleted"
         enum permission_level "personal/team/public/custom"
         JSONB metadata "title,author,created_date"
         timestamp uploaded_at
@@ -1950,7 +1961,7 @@ Collection: document_chunks
   Fields:
     - id: INT64, PK, auto_id=True
     - doc_id: VARCHAR(36)  # 用于权限过滤和删除
-    - kb_id: VARCHAR(36)   # 知识库隔离
+    - kb_id: VARCHAR(36)   # 知识库Partition隔离键
     - chunk_index: INT32
     - content: VARCHAR(4096)  # 脱敏后文本
     - embedding: FLOAT_VECTOR(1024)  # BGE-M3维度
@@ -1958,12 +1969,13 @@ Collection: document_chunks
     - metadata: JSON  # {page_num, section_title, token_count, created_at}
 
   Index:
-    - embedding: IVF_FLAT or HNSW, metric_type=COSINE
-    - sparse_vector: SPARSE_INVERTED_INDEX
+    - embedding: HNSW, metric_type=COSINE
+      params: {M: 16, efConstruction: 256}
+    - sparse_vector: SPARSE_INVERTED_INDEX, metric_type=IP
 
   Partitions:
-    - 按kb_id动态创建（物理隔离）
-    - 或按permission_level分区（public/team/private）
+    - _default
+    - kb_{kb_id}  # 按知识库动态创建Partition（物理隔离）
 ```
 
 ---
@@ -1972,18 +1984,20 @@ Collection: document_chunks
 
 ### 7.1 文档状态机
 
+> 实际数据模型中，文档状态拆分为 `processing_status`（PENDING / PARSING / CHUNKED / INDEXING / INDEXED / PARTIAL / FAILED）与 `lifecycle_status`（ACTIVE / ARCHIVED / DELETING / DELETED）。下图将两类状态合并展示，便于理解完整生命周期。
+
 ```mermaid
 stateDiagram-v2
-    [*] --> UPLOADED: 文件上传完成
-    UPLOADED --> PARSING: 任务队列消费
+    [*] --> PENDING: 文件上传完成
+    PENDING --> PARSING: 任务队列消费
     PARSING --> CHUNKED: 解析成功
     PARSING --> FAILED: 解析异常
     CHUNKED --> INDEXING: 开始Embedding
     CHUNKED --> FAILED: 分块异常
     INDEXING --> INDEXED: 索引构建成功
-    INDEXING --> PARTIAL_INDEXED: 部分Chunk失败
+    INDEXING --> PARTIAL: 部分Chunk失败
     INDEXING --> FAILED: 索引服务异常
-    PARTIAL_INDEXED --> INDEXED: 人工修复重试
+    PARTIAL --> INDEXED: 人工修复重试
     FAILED --> PARSING: 手动重试（max 3）
     INDEXED --> UPDATING: 上传新版本
     UPDATING --> PARSING: 重新解析
@@ -2048,7 +2062,7 @@ stateDiagram-v2
 
     note right of PLANNING
         超时检测：每5秒检查
-        总耗时 > 30秒 → 强制降级
+        总耗时 > 60秒 → 强制降级
     end note
 ```
 
@@ -2115,7 +2129,8 @@ Response: 202 Accepted
       "doc_id": "uuid",
       "task_id": "uuid",
       "filename": "example.pdf",
-      "status": "UPLOADED",
+      "processing_status": "PENDING",
+      "lifecycle_status": "ACTIVE",
       "estimated_time_seconds": 120
     }
   ],
@@ -2134,7 +2149,7 @@ Errors:
 
 #### 8.2.2 查询文档列表
 ```
-GET /documents?kb_id={uuid}&keyword={string}&file_type={string}&status={enum}&sort_by={enum}&page={int}&page_size={int}
+GET /documents?kb_id={uuid}&keyword={string}&file_type={string}&processing_status={enum}&lifecycle_status={enum}&sort_by={enum}&page={int}&page_size={int}
 
 Response: 200 OK
 {
@@ -2146,7 +2161,8 @@ Response: 200 OK
       "file_size": 2048000,
       "page_count": 45,
       "uploader": {"id": "uuid", "name": "张三"},
-      "status": "INDEXED",
+      "processing_status": "INDEXED",
+      "lifecycle_status": "ACTIVE",
       "tags": ["产品", "战略"],
       "permission_level": "team",
       "uploaded_at": "2026-07-01T10:00:00Z",
@@ -2167,10 +2183,12 @@ Response: 202 Accepted
 {
   "doc_id": "uuid",
   "deletion_task_id": "uuid",
-  "status": "DELETING",
+  "lifecycle_status": "DELETING",
   "estimated_cleanup_time": "30s"
 }
 ```
+
+**副作用**：接口返回后，系统将异步删除VectorDB中该doc_id的全部chunk，并级联清除Redis中该文档的Embedding缓存及按用户维度的Query缓存。
 
 #### 8.2.4 获取文档分块
 ```
@@ -2324,7 +2342,7 @@ Request:
   "conversation_id": "uuid",
   "query": "对比2024年和2025年产品策略的差异",
   "max_steps": 10,
-  "timeout": 30,
+  "timeout": 60,
   "enable_tools": ["document_search", "calculator"],  // 可选，默认全部
   "stream_trace": true  // 是否流式输出执行轨迹
 }
@@ -2617,7 +2635,7 @@ Response: 200 OK
 | BR-AGT-002 | 用户可管理Agent记忆 | 用户访问个人设置 | 提供查看/编辑/删除记忆入口 |
 | BR-AGT-003 | 记忆数据加密且可销毁 | 用户注销或删除记忆 | AES-256加密，注销时物理删除 |
 | BR-AGT-004 | 低置信度实体不入库 | NER置信度 < 0.7 | 丢弃该实体，避免噪声记忆 |
-| BR-AGT-005 | Agent超时强制降级 | 总耗时 > 30秒 | 中断执行，返回部分答案，降级RAG |
+| BR-AGT-005 | Agent超时强制降级 | 总耗时 > 60秒 | 中断执行，返回部分答案，降级RAG |
 | BR-AGT-006 | 工具调用失败自动重试 | 工具返回异常 | 重试1次，仍失败则跳过并告知用户 |
 | BR-AGT-007 | 反思不通过重新执行 | reflection.passed=false | 修正计划重新执行，最多2轮 |
 | BR-AGT-008 | 工具权限隔离 | 用户禁用某工具 | Agent执行时跳过该工具 |
@@ -2654,7 +2672,7 @@ Response: 200 OK
 | | 上下文窗口溢出 | 历史消息Token超限 | 生成前校验 | 自动摘要早期对话 | 提示"已自动摘要历史对话" |
 | | 配额耗尽 | Redis计数器达到阈值 | 请求前校验 | 返回429，提供紧急申请入口 | "配额已用完，请联系管理员" |
 | | 内容安全拦截 | 输出涉政/涉黄 | 安全API返回 | 替换为安全提示 | "内容涉及敏感信息，已过滤" |
-| **Agent执行** | Agent超时 | 执行超过30秒 | 定时器 | 中断执行，返回部分答案，降级RAG | "任务复杂，已返回部分分析" |
+| **Agent执行** | Agent超时 | 执行超过60秒 | 定时器 | 中断执行，返回部分答案，降级RAG | "任务复杂，已返回部分分析" |
 | | 工具调用失败 | 网络/权限问题 | 工具返回异常 | 重试1次，跳过并告知 | "部分信息获取失败，答案可能不完整" |
 | | 反思不通过 | 引用缺失/逻辑矛盾 | Self-Reflection | 重新检索/重新分析，最多2轮 | 无感知（延迟增加） |
 | **安全** | Prompt Injection | 输入恶意指令 | 检测模型 | 拦截请求，记录安全事件 | "输入包含不安全内容" |
@@ -2732,7 +2750,7 @@ IF monthly_cost > budget * 120%:
 | E-DM-003 | BATCH_TOO_LARGE | 400 | 批量总大小超过500MB | 提示分批上传 |
 | E-DM-004 | VIRUS_DETECTED | 400 | 文件包含恶意内容 | 拒绝上传，通知管理员 |
 | E-DM-005 | PARSE_FAILED | 422 | 文档解析失败 | 提示具体原因（密码保护/扫描件） |
-| E-DM-006 | INDEX_FAILED | 500 | 向量索引构建失败 | 标记为PARTIAL_INDEXED，人工介入 |
+| E-DM-006 | INDEX_FAILED | 500 | 向量索引构建失败 | 标记processing_status=PARTIAL，人工介入 |
 | E-RAG-001 | MODEL_SERVICE_UNAVAILABLE | 503 | 模型服务熔断 | 自动切换备用，用户无感知 |
 | E-RAG-002 | GENERATION_TIMEOUT | 200 | 生成超时 | 返回已生成内容，提示不完整 |
 | E-RAG-003 | CONTENT_SAFETY_BLOCKED | 200 | 内容安全拦截 | 显示安全提示，不展示原文 |
@@ -2765,6 +2783,7 @@ IF monthly_cost > budget * 120%:
 | 版本 | 日期 | 变更内容 | 作者 | 审批状态 |
 |------|------|----------|------|----------|
 | v1.0 | 2026-07-05 | 基于PRD v2.0初始创建FSD，包含功能规格、业务流程、数据流图、数据模型、状态机、API定义、业务规则、异常处理 | 技术团队 | 待评审 |
+| v1.1 | 2026-07-05 | 根据开发手册评审结论修订：统一向量隔离为单Collection+按kb_id Partition；Agent超时改为60s并降为P1；明确calculator沙箱；task_queue表为只读运营视图；Query缓存按用户隔离；拆分文档processing_status/lifecycle_status；删除API补充级联清理说明 | 技术团队 | 已评审 |
 
 ### 11.4 待确认事项
 
